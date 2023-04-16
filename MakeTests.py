@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
 ## TIPS
 #	MACPORT
 #		Install MacPorts https://www.macports.org
@@ -40,6 +39,7 @@ class QuestionMatrix(Question):
 
 
 
+from pickle import FALSE
 import sys
 req_version = (3,0)
 cur_version = sys.version_info
@@ -55,7 +55,7 @@ elif _platform == "win32":
 	sys.exit("Windows has not yet been tested.")
 
 try:
-	import conda, pip, cv2, qrcode, pyzbar, barcode, PyPDF2, pytesseract
+	import conda, pip, cv2, qrcode, pyzbar, barcode, PyPDF2, tensorflow
 except ImportError as error:
 	if error.name == "conda":
 		sys.exit("Please, install anaconda3 (https://www.anaconda.com/download) or miniconda3 (https://docs.conda.io/en/latest/miniconda.html).")
@@ -66,8 +66,7 @@ except ImportError as error:
                         "PyPDF2":      ["conda", "install", "-c", "conda-forge", "pypdf2"],
                         "tesseract":   ["conda", "install", "-c", "conda-forge", "tesseract"],
                         "pyzbar":      ["pip",   "install",                      "pyzbar"],
-                        "barcode":     ["pip",   "install",                      "python-barcode"],
-                        "pytesseract": ["pip",   "install",                      "pytesseract"]}
+                        "barcode":     ["pip",   "install",                      "python-barcode"]}
 		if cur_version < (3,7):
 			package_name["cv2"] = ["conda", "install", "-c", "menpo",       "opencv3"]
 		elif cur_version < (3,8):
@@ -269,10 +268,10 @@ class Utils:
 		import PyPDF2 as pypdf
 		import numpy as np
 		from PIL import Image
-		pdf = pypdf.PdfFileReader(open(pdf_filename, "rb"))
-		for pg in range(pdf.getNumPages()):
-			page = pdf.getPage(pg)
-			objs = page['/Resources']['/XObject'].getObject()
+		pdf = pypdf.PdfReader(open(pdf_filename, "rb"))
+		for pg in range(len(pdf.pages)):
+			page = pdf.pages[pg]
+			objs = page['/Resources']['/XObject'].get_object()
 			for obj in objs:
 				if objs[obj]['/Subtype'] == '/Image':
 					if objs[obj]['/Filter'] == '/DCTDecode':
@@ -371,7 +370,7 @@ class ImageUtils:
 				c2,r2 = markers[i2] 
 				p1, p2 = ImageUtils.findPointsPerpendicularToTheLine(c1, c2, r1)
 				p3, p4 = ImageUtils.findPointsPerpendicularToTheLine(c2, c1, r2)
-				box = np.int0([p1, p2, p3, p4])
+				box = np.intp([p1, p2, p3, p4])
 				warp = ImageUtils.warpImage(img, box)
 				for p,d,t in ImageUtils.barcodeDecoder(warp):
 					if verbose:
@@ -422,13 +421,13 @@ class ImageUtils:
 			# Get answer area
 			ansArea = ImageUtils.warpImage(img, (tl,tr,br,bl))
 			if verbose:
-				cv2.drawContours(img, [np.int0([tl,tr,br,bl])],0,(0,255,255), thickness=2)
+				cv2.drawContours(img, [np.intp([tl,tr,br,bl])],0,(0,255,255), thickness=2)
 
 			# Normalize the width of the Answer Area
 			h, w, _ = ansArea.shape
 			ansArea = cv2.resize(ansArea, (ImageUtils.IMAGE_WIDTH,int(ImageUtils.IMAGE_WIDTH*h/w)))
 
-			yield ansArea, code, [np.int0([tl,tr,br,bl])], markers_info
+			yield ansArea, code, [np.intp([tl,tr,br,bl])], markers_info
 
 	@staticmethod
 	def makeBarcode(data, typeBarcode='code128'):
@@ -634,6 +633,24 @@ class ImageUtils:
 	@staticmethod
 	def midPoint(p1, p2):
 		return ((p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5)
+	
+	@staticmethod
+	def resize_and_center(sample, new_size=28):
+		from PIL import ImageOps
+		import numpy as np
+		sample = ImageUtils.opencv2pil(sample)
+		sample = sample.convert('L')
+
+		inv_sample = ImageOps.invert(sample)
+		inv_sample = inv_sample.resize((new_size,new_size)) 
+		inv_sample = inv_sample.point( lambda p: 255 if p>100 else 0)
+		bbox = inv_sample.getbbox()
+		crop = inv_sample.crop(bbox)
+		delta_w = new_size - crop.size[0]
+		delta_h = new_size - crop.size[1]
+		padding = (delta_w//2, delta_h//2, delta_w-(delta_w//2), delta_h-(delta_h//2))
+		return np.array((ImageOps.expand(crop, padding)))/255.0
+
 # BEGIN IMAGE PROCESSOR #
 #########################
 
@@ -1255,6 +1272,75 @@ class QuestionNumber(QuestionMatrix):
 # END QUESTION NUMBER #
 #######################
 
+######################
+# BEGIN QUESTION OCR #
+class QuestionOCR(Question):
+	cell_width = 100
+	cell_height = 100
+	
+	def makeVariables(self):
+		self.makeSetup()
+		self.rows = [str(i) for i in range(1,1+self.max_digits)]
+		self.cols = [str(i) for i in range(0,10)]
+		if self.decimal_separator is not None:
+			self.cols.append(self.decimal_separator)
+	
+	def drawAnswerArea(self, img):
+		import cv2,numpy as np
+		height,width,_ = img.shape
+		center = height/2
+		cell_width = self.cell_width
+		cell_height = self.cell_height
+		num_cols = width // cell_width
+		padding = (width - cell_width * num_cols)/2
+		for col in range(num_cols):
+			topLeft = (int(col * cell_width + padding),int(center + cell_height/2))
+			botRight = (int((col + 1) * cell_width + padding),int(center - cell_height/2 ))
+			img = cv2.rectangle(img, topLeft, botRight, (0,0,0),2)
+
+	def doCorrection(self, img):
+		import numpy as np
+		from tensorflow import keras
+
+		model = keras.models.load_model('modelo')
+
+		height,width,_ = img.shape
+		center = height/2
+		cell_width = self.cell_width
+		cell_height = self.cell_height
+		num_cols = width // cell_width
+		padding = int((width - cell_width * num_cols)/2)
+		border = 5
+		digits = []
+		for i in range(padding,width,cell_width):
+			cut = img[int(center-cell_height/2)+border:int(center+cell_height/2)-border , i+border:i+cell_width-border]
+			digits.append(cut)
+		resized = []
+		for i in digits:
+			resized.append(ImageUtils.resize_and_center(i))
+		resized = np.array(resized)
+		predictions = model.predict(resized)
+		dig = ""
+		for i in range(0,len(self.getAnswerText(LaTeX=False))):
+			dig+=str(np.argmax(predictions[i]))
+
+		try: value = float(dig)
+		except ValueError: return self.getScore(None) # Invalid
+
+		answer = np.zeros((60, img.shape[1], 3), np.uint8)
+		answer[:,:] = (255,255,255)
+		ImageUtils.drawTextInsideTheBox(answer,dig)
+		answer = np.vstack((answer,img))
+		imgInfo = np.zeros((60, img.shape[1], 3), np.uint8)
+		imgInfo[:,:] = (255,255,255)
+		ImageUtils.drawTextInsideTheBox(imgInfo, dig)
+		imgInfo = np.vstack((imgInfo, img))
+
+		return self.getScore(dig),answer,imgInfo
+
+
+# END QUESTION OCR #
+####################
 
 
 ######################################
@@ -1352,24 +1438,6 @@ class QuestionQA(QuestionMatrix):
 
 
 
-######################
-# BEGIN QUESTION OCR #
-class QuestionOCR(Question):
-	def getScore(self, text):
-		raise Exception("Method not implemented.")
-	def drawAnswerArea(self, img):
-		import cv2
-		return cv2.rectangle(img, (0,0), (img.shape[1],img.shape[0]),(0,0,0), thickness=2, lineType=cv2.LINE_AA)
-	def doCorrection(self, img):
-		import pytesseract
-		img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-		img_gray = cv2.medianBlur(img_gray, 5)
-		img_gray = cv2.GaussianBlur(img_gray, (7,7),0)
-		img_gray = cv2.adaptiveThreshold(img_gray,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,9,C=2)
-		img_gray = cv2.morphologyEx(img_gray, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(7,7)))
-		return self.getScore(pytesseract.image_to_string(img_gray)), img_gray
-# END QUESTION OCR #
-####################
 
 
 
@@ -1895,7 +1963,7 @@ class Main:
 			if self.verbose > 0:
 				print("PDF '{}' generated.".format(self.config['output']['answer_key']))
 		except CalledProcessError as e:
-			if self.verbose > 1: raise Exception(ansserKey.getError())
+			if self.verbose > 1: raise Exception(answerKey.getError())
 			else:                raise Exception("Error to generate {}". format(self.config['output']['answer_key']))
 		except UnicodeDecodeError as e:
 			if self.verbose > 1: raise Exception(e.args)
@@ -1977,6 +2045,7 @@ class Main:
 			question = questions[question_num]
 
 			# Get score for the current question
+			#start
 			score, ansAreaPosProc, ansFeedback = question.doCorrection(ansArea.copy())
 			if score is None:
 				continue # Impossible to correct the current answer area, go to next answer area
